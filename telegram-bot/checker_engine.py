@@ -12,72 +12,83 @@ import uuid
 import random
 import tempfile
 import binascii
-from urllib.parse import urlparse, parse_qs, unquote
+from urllib.parse import urlparse, parse_qs, unquote, urlencode, urlunparse
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import urllib3
 
 urllib3.disable_warnings()
 
-# === SETTINGS ===
+# === SETTINGS (OPTIMIZED FOR WEAK VPS/PC) ===
 SYSTEM = platform.system()
 PING_URL = "https://cp.cloudflare.com/"
 GEO_URL = "https://api.myip.com"
-TIMEOUT_SEC = 6
+TIMEOUT_SEC = 8  # Чуть больше времени на ответ
 CHECK_IP_LEAK = True 
 
-# Версия ядра. Можно обновлять при выходе новых версий.
-SINGBOX_TAG = "v1.9.0"
-SINGBOX_VER = "sing-box-1.9.0"
+# Настройки процесса
+# Даем больше времени на запуск ядра, так как батчи будут большими
+STARTUP_TIMEOUT = 25.0 
+PAUSE_BETWEEN_BATCHES = 0.5
+
+SING_VER = "1.11.4"
 
 if SYSTEM == "Windows":
     CORE_NAME = "sing-box.exe"
-    CORE_URL = f"https://github.com/SagerNet/sing-box/releases/download/{SINGBOX_TAG}/{SINGBOX_VER}-windows-amd64.zip"
-    PAUSE = 1.0
+    CORE_URL = f"https://github.com/SagerNet/sing-box/releases/download/v{SING_VER}/sing-box-{SING_VER}-windows-amd64.zip"
 elif SYSTEM == "Linux":
     CORE_NAME = "sing-box"
-    CORE_URL = f"https://github.com/SagerNet/sing-box/releases/download/{SINGBOX_TAG}/{SINGBOX_VER}-linux-amd64.tar.gz"
-    PAUSE = 0.0
+    CORE_URL = f"https://github.com/SagerNet/sing-box/releases/download/v{SING_VER}/sing-box-{SING_VER}-linux-amd64.tar.gz"
 elif SYSTEM == "Darwin":
     CORE_NAME = "sing-box"
-    CORE_URL = f"https://github.com/SagerNet/sing-box/releases/download/{SINGBOX_TAG}/{SINGBOX_VER}-darwin-amd64.tar.gz"
-    PAUSE = 0.1
+    CORE_URL = f"https://github.com/SagerNet/sing-box/releases/download/v{SING_VER}/sing-box-{SING_VER}-darwin-amd64.tar.gz"
 else: 
     print(f"Unsupported OS: {SYSTEM}")
     exit(1)
 
-# === GLOBAL THREAD POOL ===
-# Если бот будет падать с ошибкой "Too many open files", уменьшите это число до 50 или 100
-GLOBAL_POOL = ThreadPoolExecutor(max_workers=200)
+# Ограничиваем потоки, чтобы CPU не захлебнулся (было 200)
+GLOBAL_POOL = ThreadPoolExecutor(max_workers=60)
 
 # === UTILS ===
 
 def get_my_ip():
     if not CHECK_IP_LEAK: return None
-    try: return requests.get(GEO_URL, proxies={"http": None, "https": None}, timeout=10).json().get("ip")
+    try: return requests.get(GEO_URL, proxies={"http": None, "https": None}, timeout=5).json().get("ip")
     except: return None
 
 def robust_base64_decode(s):
-    """Улучшенный декодер Base64, устойчивый к ошибкам паддинга и мусору."""
     if not s: return ""
-    s = s.strip().replace(" ", "")
-    s = s.replace('-', '+').replace('_', '/')
+    s = s.strip().replace(" ", "").replace('-', '+').replace('_', '/')
     padding = len(s) % 4
-    if padding:
-        s += '=' * (4 - padding)
-    try:
-        return base64.b64decode(s).decode('utf-8', errors='ignore')
-    except Exception:
-        return ""
+    if padding: s += '=' * (4 - padding)
+    try: return base64.b64decode(s).decode('utf-8', errors='ignore')
+    except: return ""
 
 def validate_port(p):
     try: return 1 <= int(p) <= 65535
     except: return False
 
+def clean_url_logic(link):
+    """Очистка ссылки от мусора для лучшей дедупликации"""
+    try:
+        link = link.strip()
+        if '#' in link: link = link.split('#')[0]
+        if "://" in link:
+            u = urlparse(link)
+            if u.query:
+                q = parse_qs(u.query, keep_blank_values=True)
+                changed = False
+                for junk in ['name', 'spider', 'remarks', 'plugin', 'udp', 'allowInsecure']:
+                    if junk in q: del q[junk]; changed = True
+                if changed:
+                    new_query = urlencode(q, doseq=True)
+                    link = urlunparse((u.scheme, u.netloc, u.path, u.params, new_query, ''))
+        return link
+    except: return link
+
 def tcp_precheck_task(host, port):
     try:
-        ip = socket.gethostbyname(host)
-        with socket.create_connection((ip, port), timeout=2.0): return True
+        with socket.create_connection((host, port), timeout=2.5): return True
     except: return False
 
 @contextmanager
@@ -100,10 +111,9 @@ def managed_process(cmd):
 
 def ensure_core():
     if os.path.exists(CORE_NAME): return
-    print(f"[*] Downloading {CORE_NAME}...")
+    print(f"[*] Downloading {CORE_NAME} v{SING_VER}...")
     try:
         urllib.request.urlretrieve(CORE_URL, "singbox_archive")
-        
         if CORE_URL.endswith('.zip'):
             with zipfile.ZipFile("singbox_archive", "r") as z:
                 for f in z.namelist():
@@ -116,9 +126,6 @@ def ensure_core():
                     if m.name.endswith("sing-box"):
                         with open(CORE_NAME, "wb") as fo: fo.write(t.extractfile(m).read()); break
         
-        if not os.path.exists(CORE_NAME):
-            raise RuntimeError(f"Binary '{CORE_NAME}' not found inside archive!")
-
         if SYSTEM != "Windows": 
             os.chmod(CORE_NAME, 0o755)
             if SYSTEM == "Darwin":
@@ -132,7 +139,7 @@ def ensure_core():
         if os.path.exists(CORE_NAME): os.remove(CORE_NAME)
         raise RuntimeError(f"Failed to download sing-box core: {e}")
 
-# === IMPROVED PARSER ===
+# === PARSER ===
 
 def parse_proxy(link, tag):
     try:
@@ -141,175 +148,81 @@ def parse_proxy(link, tag):
         
         outbound = {}
         proto = "Unknown"
-        fp = random.choice(["chrome", "firefox", "safari", "edge", "ios"])
+        fp = "chrome" 
         r_host, r_port = None, None
 
-        # --- VMESS ---
         if link.startswith("vmess://"):
             proto = "VMess"
-            b64_part = link[8:]
-            json_str = robust_base64_decode(b64_part)
-            if not json_str: return None, None, None, None
-            
-            j = json.loads(json_str)
-            
-            # Унификация полей
+            j = json.loads(robust_base64_decode(link[8:]))
             r_port = int(j.get("port", 0) or j.get("server_port", 0))
             if not validate_port(r_port): return None, None, None, None
             
             r_host = j.get("add") or j.get("host") or j.get("ip")
-            if not r_host: return None, None, None, None
-
-            outbound = {
-                "type": "vmess", 
-                "tag": tag, 
-                "server": r_host, 
-                "server_port": r_port, 
-                "uuid": j.get("id") or j.get("uuid"), 
-                "security": "auto"
-            }
+            outbound = {"type": "vmess", "tag": tag, "server": r_host, "server_port": r_port, "uuid": j.get("id") or j.get("uuid"), "security": "auto"}
             
             net = j.get("net", "tcp")
             if net in ["ws", "websocket"]:
-                outbound["transport"] = {
-                    "type": "ws", 
-                    "path": j.get("path", "/"), 
-                    "headers": {"Host": j.get("host", "")}
-                }
+                outbound["transport"] = {"type": "ws", "path": j.get("path", "/"), "headers": {"Host": j.get("host", "")}}
             elif net == "grpc":
-                outbound["transport"] = {
-                    "type": "grpc", 
-                    "service_name": j.get("path", "") or j.get("serviceName", "")
-                }
+                outbound["transport"] = {"type": "grpc", "service_name": j.get("path", "")}
             
-            tls_val = str(j.get("tls", "")).lower()
-            if tls_val in ["tls", "1", "true"]:
-                outbound["tls"] = {
-                    "enabled": True, 
-                    "server_name": j.get("sni") or j.get("host") or r_host, 
-                    "insecure": True, 
-                    "utls": {"enabled": True, "fingerprint": fp}
-                }
+            if str(j.get("tls", "")).lower() in ["tls", "1", "true"]:
+                outbound["tls"] = {"enabled": True, "server_name": j.get("sni") or j.get("host") or r_host, "insecure": True, "utls": {"enabled": True, "fingerprint": fp}}
 
-        # --- VLESS ---
         elif link.startswith("vless://"):
             proto = "VLESS"
-            u = urlparse(link)
-            q = parse_qs(u.query)
-            
+            u = urlparse(link); q = parse_qs(u.query)
             if not validate_port(str(u.port)): return None, None, None, None
             r_host, r_port = u.hostname, u.port
-            
-            outbound = {
-                "type": "vless", "tag": tag, "server": r_host, "server_port": r_port, 
-                "uuid": u.username, "flow": q.get("flow", [""])[0]
-            }
+            outbound = {"type": "vless", "tag": tag, "server": r_host, "server_port": r_port, "uuid": u.username, "flow": q.get("flow", [""])[0]}
             
             type_net = q.get("type", ["tcp"])[0]
-            if type_net == "ws":
-                outbound["transport"] = {
-                    "type": "ws", 
-                    "path": q.get("path", ["/"])[0], 
-                    "headers": {"Host": q.get("host", [""])[0]}
-                }
-            elif type_net == "grpc":
-                outbound["transport"] = {
-                    "type": "grpc", 
-                    "service_name": q.get("serviceName", [""])[0]
-                }
+            if type_net == "ws": outbound["transport"] = {"type": "ws", "path": q.get("path", ["/"])[0], "headers": {"Host": q.get("host", [""])[0]}}
+            elif type_net == "grpc": outbound["transport"] = {"type": "grpc", "service_name": q.get("serviceName", [""])[0]}
             
-            security = q.get("security", ["none"])[0]
-            if security == "tls":
-                outbound["tls"] = {
-                    "enabled": True, 
-                    "server_name": q.get("sni", [""])[0] or r_host, 
-                    "insecure": True, 
-                    "utls": {"enabled": True, "fingerprint": fp}
-                }
-            elif security == "reality":
-                outbound["tls"] = {
-                    "enabled": True, 
-                    "server_name": q.get("sni", [""])[0] or r_host, 
-                    "reality": {
-                        "enabled": True, 
-                        "public_key": q.get("pbk", [""])[0], 
-                        "short_id": q.get("sid", [""])[0]
-                    }, 
-                    "utls": {"enabled": True, "fingerprint": q.get("fp", [fp])[0]}
-                }
+            sec = q.get("security", ["none"])[0]
+            if sec == "tls":
+                outbound["tls"] = {"enabled": True, "server_name": q.get("sni", [""])[0] or r_host, "insecure": True, "utls": {"enabled": True, "fingerprint": fp}}
+            elif sec == "reality":
+                outbound["tls"] = {"enabled": True, "server_name": q.get("sni", [""])[0] or r_host, "reality": {"enabled": True, "public_key": q.get("pbk", [""])[0], "short_id": q.get("sid", [""])[0]}, "utls": {"enabled": True, "fingerprint": q.get("fp", [fp])[0]}}
 
-        # --- SHADOWSOCKS ---
         elif link.startswith("ss://"):
             proto = "Shadowsocks"
-            # Логика для SIP002 (URL-like) и Legacy (Base64)
-            full_url = link
-            parsed = urlparse(full_url)
-            
-            # Если нет netloc, пробуем декодировать старый формат ss://BASE64
+            parsed = urlparse(link)
             if not parsed.netloc:
-                parts = full_url[5:].split('#', 1)
+                parts = link[5:].split('#', 1)
                 decoded = robust_base64_decode(parts[0])
-                if '@' in decoded:
-                    parsed = urlparse(f"ss://{decoded}")
+                if '@' in decoded: parsed = urlparse(f"ss://{decoded}")
             
             if parsed.netloc and '@' in parsed.netloc:
                 userinfo, host_port = parsed.netloc.rsplit('@', 1)
                 if ':' in host_port:
                     r_host, p_str = host_port.rsplit(':', 1)
-                    # Очистка порта от ?plugin=...
                     p_str = p_str.split('/')[0].split('?')[0]
                     if validate_port(p_str):
                         r_port = int(p_str)
-                        
-                        # Декодируем userinfo (method:pass), если он в base64
-                        if ':' not in userinfo:
-                            userinfo = robust_base64_decode(userinfo)
-                        
+                        if ':' not in userinfo: userinfo = robust_base64_decode(userinfo)
                         if ':' in userinfo:
                             method, pwd = userinfo.split(':', 1)
-                            outbound = {
-                                "type": "shadowsocks", "tag": tag, 
-                                "server": r_host, "server_port": r_port, 
-                                "method": method, "password": unquote(pwd)
-                            }
+                            outbound = {"type": "shadowsocks", "tag": tag, "server": r_host, "server_port": r_port, "method": method, "password": unquote(pwd)}
 
-        # --- TROJAN ---
         elif link.startswith("trojan://"):
             proto = "Trojan"
             u = urlparse(link); q = parse_qs(u.query)
             if not u.port or not validate_port(str(u.port)): return None, None, None, None
             r_host, r_port = u.hostname, u.port
-            outbound = {
-                "type": "trojan", "tag": tag, "server": r_host, "server_port": r_port, 
-                "password": u.username, 
-                "tls": {
-                    "enabled": True, 
-                    "server_name": q.get("sni", [""])[0] or r_host, 
-                    "insecure": True, 
-                    "utls": {"enabled": True, "fingerprint": fp}
-                }
-            }
+            outbound = {"type": "trojan", "tag": tag, "server": r_host, "server_port": r_port, "password": u.username, "tls": {"enabled": True, "server_name": q.get("sni", [""])[0] or r_host, "insecure": True, "utls": {"enabled": True, "fingerprint": fp}}}
 
-        # --- HYSTERIA 2 ---
         elif link.startswith(("hy2://", "hysteria2://")):
             proto = "Hysteria2"
             u = urlparse(link); q = parse_qs(u.query)
-            r_host, r_port = u.hostname, u.port
-            if not validate_port(str(r_port)): return None, None, None, None
-            
+            if not u.port or not validate_port(str(u.port)): return None, None, None, None
             pwd = unquote(u.password or u.username or "")
-            outbound = {
-                "type": "hysteria2", "tag": tag, "server": r_host, "server_port": r_port, 
-                "password": pwd,
-                "tls": {
-                    "enabled": True, 
-                    "server_name": q.get("sni", [u.hostname])[0], 
-                    "insecure": True, 
-                    "alpn": ["h3"]
-                }
-            }
-            if q.get("obfs-password"): 
-                outbound["obfs"] = {"type": "salamander", "password": q.get("obfs-password")[0]}
+            r_host, r_port = u.hostname, u.port
+            sni = q.get("sni", [u.hostname])[0]
+            outbound = {"type": "hysteria2", "tag": tag, "server": r_host, "server_port": r_port, "password": pwd,
+                "tls": {"enabled": True, "server_name": sni, "insecure": True, "alpn": ["h3"]}}
+            if q.get("obfs-password"): outbound["obfs"] = {"type": "salamander", "password": q.get("obfs-password")[0]}
 
         if not outbound: return None, None, None, None
         return outbound, proto, r_host, r_port
@@ -319,7 +232,8 @@ def parse_proxy(link, tag):
 # === BATCH CHECK ===
 
 def wait_for_ports(start, count):
-    deadline = time.time() + 25.0
+    # Увеличиваем время ожидания старта ядра
+    deadline = time.time() + STARTUP_TIMEOUT
     ports = [start + i for i in range(min(count, 5))]
     while time.time() < deadline:
         ready = 0
@@ -336,17 +250,17 @@ def check_one_http_task(args):
     proxies = {'http': f'http://127.0.0.1:{sp+idx}', 'https': f'http://127.0.0.1:{sp+idx}'}
     try:
         t0 = time.time()
-        # verify=False - стандарт для чекеров, чтобы не падать на самоподписанных certs
+        # allow_redirects=False для скорости
         r = requests.get(PING_URL, proxies=proxies, timeout=TIMEOUT_SEC, verify=False, allow_redirects=False)
         lat = int((time.time() - t0) * 1000)
         
-        # 204 (No Content) или 200 (OK) с малым телом
         if r.status_code == 204 or (r.status_code == 200 and len(r.content) < 1000):
             try:
-                geo = requests.get(GEO_URL, proxies=proxies, timeout=5, verify=False).json()
+                geo = requests.get(GEO_URL, proxies=proxies, timeout=4, verify=False).json()
                 if CHECK_IP_LEAK and local_ip and geo.get("ip") == local_ip: return (False, 0, "LEAK", item)
                 return (True, lat, geo.get("cc", "XX"), item)
             except: return (True, lat, "XX", item)
+    except requests.exceptions.Timeout: return (False, 0, "Timeout", item)
     except: pass
     return (False, 0, "Fail", item)
 
@@ -373,4 +287,4 @@ def check_batch_sync(chunk, sp, local_ip):
     finally:
         try: os.remove(tmp_name)
         except: pass
-        time.sleep(PAUSE)
+        if PAUSE_BETWEEN_BATCHES > 0: time.sleep(PAUSE_BETWEEN_BATCHES)
