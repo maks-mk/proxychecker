@@ -1,0 +1,4 @@
+#python-telegram-bot>=20.0
+requests
+aiogram>=3.0.0
+requests
