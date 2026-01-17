@@ -30,7 +30,7 @@ TOKEN = "token"
 
 # === ADMIN CONFIG ===
 ADMIN_IDS = [
-    1219886637
+    121988....
 ]
 
 # === CONFIG & LIMITS ===
