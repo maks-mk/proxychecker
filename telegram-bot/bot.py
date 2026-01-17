@@ -26,7 +26,7 @@ from checker_engine import (
 )
 
 # !!! ВСТАВЬТЕ СЮДА СВОЙ ТОКЕН !!!
-TOKEN = "7829664819:AAG6gFAWg0m1B2fBFwhXzyzxK3BTGj5feMY"
+TOKEN = "token"
 
 # === ADMIN CONFIG ===
 ADMIN_IDS = [
