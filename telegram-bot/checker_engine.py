@@ -1,3 +1,5 @@
+# --- START OF FILE checker_engine.py ---
+
 import json
 import os
 import subprocess
@@ -8,10 +10,7 @@ import zipfile
 import urllib.request
 import platform
 import socket
-import uuid
-import random
 import tempfile
-import binascii
 from urllib.parse import urlparse, parse_qs, unquote, urlencode, urlunparse
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -19,15 +18,13 @@ import urllib3
 
 urllib3.disable_warnings()
 
-# === SETTINGS (OPTIMIZED FOR WEAK VPS/PC) ===
+# === SETTINGS ===
 SYSTEM = platform.system()
 PING_URL = "https://cp.cloudflare.com/"
 GEO_URL = "https://api.myip.com"
-TIMEOUT_SEC = 8  # Чуть больше времени на ответ
+TIMEOUT_SEC = 8  
 CHECK_IP_LEAK = True 
 
-# Настройки процесса
-# Даем больше времени на запуск ядра, так как батчи будут большими
 STARTUP_TIMEOUT = 25.0 
 PAUSE_BETWEEN_BATCHES = 0.5
 
@@ -46,7 +43,6 @@ else:
     print(f"Unsupported OS: {SYSTEM}")
     exit(1)
 
-# Ограничиваем потоки, чтобы CPU не захлебнулся (было 200)
 GLOBAL_POOL = ThreadPoolExecutor(max_workers=60)
 
 # === UTILS ===
@@ -69,7 +65,6 @@ def validate_port(p):
     except: return False
 
 def clean_url_logic(link):
-    """Очистка ссылки от мусора для лучшей дедупликации"""
     try:
         link = link.strip()
         if '#' in link: link = link.split('#')[0]
@@ -156,16 +151,13 @@ def parse_proxy(link, tag):
             j = json.loads(robust_base64_decode(link[8:]))
             r_port = int(j.get("port", 0) or j.get("server_port", 0))
             if not validate_port(r_port): return None, None, None, None
-            
             r_host = j.get("add") or j.get("host") or j.get("ip")
             outbound = {"type": "vmess", "tag": tag, "server": r_host, "server_port": r_port, "uuid": j.get("id") or j.get("uuid"), "security": "auto"}
-            
             net = j.get("net", "tcp")
             if net in ["ws", "websocket"]:
                 outbound["transport"] = {"type": "ws", "path": j.get("path", "/"), "headers": {"Host": j.get("host", "")}}
             elif net == "grpc":
                 outbound["transport"] = {"type": "grpc", "service_name": j.get("path", "")}
-            
             if str(j.get("tls", "")).lower() in ["tls", "1", "true"]:
                 outbound["tls"] = {"enabled": True, "server_name": j.get("sni") or j.get("host") or r_host, "insecure": True, "utls": {"enabled": True, "fingerprint": fp}}
 
@@ -175,11 +167,9 @@ def parse_proxy(link, tag):
             if not validate_port(str(u.port)): return None, None, None, None
             r_host, r_port = u.hostname, u.port
             outbound = {"type": "vless", "tag": tag, "server": r_host, "server_port": r_port, "uuid": u.username, "flow": q.get("flow", [""])[0]}
-            
             type_net = q.get("type", ["tcp"])[0]
             if type_net == "ws": outbound["transport"] = {"type": "ws", "path": q.get("path", ["/"])[0], "headers": {"Host": q.get("host", [""])[0]}}
             elif type_net == "grpc": outbound["transport"] = {"type": "grpc", "service_name": q.get("serviceName", [""])[0]}
-            
             sec = q.get("security", ["none"])[0]
             if sec == "tls":
                 outbound["tls"] = {"enabled": True, "server_name": q.get("sni", [""])[0] or r_host, "insecure": True, "utls": {"enabled": True, "fingerprint": fp}}
@@ -193,7 +183,6 @@ def parse_proxy(link, tag):
                 parts = link[5:].split('#', 1)
                 decoded = robust_base64_decode(parts[0])
                 if '@' in decoded: parsed = urlparse(f"ss://{decoded}")
-            
             if parsed.netloc and '@' in parsed.netloc:
                 userinfo, host_port = parsed.netloc.rsplit('@', 1)
                 if ':' in host_port:
@@ -232,7 +221,6 @@ def parse_proxy(link, tag):
 # === BATCH CHECK ===
 
 def wait_for_ports(start, count):
-    # Увеличиваем время ожидания старта ядра
     deadline = time.time() + STARTUP_TIMEOUT
     ports = [start + i for i in range(min(count, 5))]
     while time.time() < deadline:
@@ -250,7 +238,6 @@ def check_one_http_task(args):
     proxies = {'http': f'http://127.0.0.1:{sp+idx}', 'https': f'http://127.0.0.1:{sp+idx}'}
     try:
         t0 = time.time()
-        # allow_redirects=False для скорости
         r = requests.get(PING_URL, proxies=proxies, timeout=TIMEOUT_SEC, verify=False, allow_redirects=False)
         lat = int((time.time() - t0) * 1000)
         
