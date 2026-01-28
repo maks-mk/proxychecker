@@ -1,403 +1,648 @@
-import json
-import os
-import subprocess
-import time
+import asyncio
+import atexit
 import base64
-import requests
-import zipfile
-import urllib.request
+import binascii
+import hashlib
+import json
+import logging
+import os
+import platform
+import random
+import re
+import shutil
 import socket
 import statistics
-import platform
+import subprocess
+import sys
 import tempfile
-import random
+import time
+import urllib.request
 import uuid
-import threading
-from urllib.parse import urlparse, parse_qs, unquote, urlencode, urlunparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
-from contextlib import contextmanager
+from typing import Optional, Tuple, List, Dict, Any
+from urllib.parse import urlparse, parse_qs, unquote, urlencode, quote
 
-# Отключаем SSL предупреждения
-import urllib3
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
+# Сторонние библиотеки
 try:
+    import aiohttp
+    import requests
+    from tqdm.asyncio import tqdm_asyncio
     from tqdm import tqdm
     from colorama import init, Fore, Style
+    import urllib3
+    
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     init(autoreset=True)
-except ImportError:
-    print("Установите либы: pip install tqdm colorama requests")
-    exit(1)
+except ImportError as e:
+    print(f"❌ Ошибка: Не установлены необходимые библиотеки. ({e})")
+    print("👉 Выполните: pip install aiohttp requests tqdm colorama")
+    sys.exit(1)
 
-# ================== КОНФИГУРАЦИЯ (LITE / DETAILED STATS) ==================
+# ================== КОНФИГУРАЦИЯ ==================
 
 KEYS_DIR = "keys"
 OUT_DIR = "output"
 SYSTEM = platform.system()
 
+# Используем HTTPS для реалистичной проверки TLS
 PING_URL = "https://cp.cloudflare.com/"
-GEO_URL = "https://api.myip.com"
-TIMEOUT_SEC = 8         
-CHECK_IP_LEAK = True
-
-# Настройки производительности (под слабый ПК)
-if SYSTEM == "Windows":
-    BATCH_SIZE = 100            
-    STARTUP_TIMEOUT = 35.0      
-    PAUSE_BETWEEN_BATCHES = 1.0 
-else:
-    BATCH_SIZE = 100
-    STARTUP_TIMEOUT = 15.0
-    PAUSE_BETWEEN_BATCHES = 0.5
+GEO_URL = "http://ip-api.com/json/"
+TIMEOUT_SEC = 10
+BATCH_SIZE = 60 if SYSTEM == "Windows" else 120 
+STARTUP_TIMEOUT = 15.0
 
 SING_VER = "1.11.4"
-# Авто-выбор имени файла
-if SYSTEM == "Windows":
-    os.system('color')
-    CORE_EXE = "sing-box.exe"
-    CORE_URL = f"https://github.com/SagerNet/sing-box/releases/download/v{SING_VER}/sing-box-{SING_VER}-windows-amd64.zip"
-elif SYSTEM == "Linux":
-    CORE_EXE = "sing-box"
-    CORE_URL = f"https://github.com/SagerNet/sing-box/releases/download/v{SING_VER}/sing-box-{SING_VER}-linux-amd64.tar.gz"
-elif SYSTEM == "Darwin":
-    CORE_EXE = "sing-box"
-    CORE_URL = f"https://github.com/SagerNet/sing-box/releases/download/v{SING_VER}/sing-box-{SING_VER}-darwin-amd64.tar.gz"
-else:
-    exit(1)
+CORE_NAME = "sing-box.exe" if SYSTEM == "Windows" else "sing-box"
 
-GLOBAL_POOL = ThreadPoolExecutor(max_workers=60) 
-TCP_SEM = threading.Semaphore(150)
+SING_URLS = {
+    "Windows": f"https://github.com/SagerNet/sing-box/releases/download/v{SING_VER}/sing-box-{SING_VER}-windows-amd64.zip",
+    "Linux": f"https://github.com/SagerNet/sing-box/releases/download/v{SING_VER}/sing-box-{SING_VER}-linux-amd64.tar.gz",
+    "Darwin": f"https://github.com/SagerNet/sing-box/releases/download/v{SING_VER}/sing-box-{SING_VER}-darwin-amd64.tar.gz"
+}
 
-os.makedirs(KEYS_DIR, exist_ok=True)
-os.makedirs(OUT_DIR, exist_ok=True)
-LIVE_FILE = os.path.join(OUT_DIR, "live.txt")
+ACTIVE_PROCESSES = []
 
-# ================== ФУНКЦИИ ==================
+def cleanup_processes():
+    """Гарантированное убийство процессов и сброс сети"""
+    for p in ACTIVE_PROCESSES:
+        try:
+            if p.poll() is None:
+                p.terminate()
+                try:
+                    p.wait(timeout=1.0)  # Увеличили таймаут
+                except subprocess.TimeoutExpired:
+                    p.kill()
+                    p.wait(timeout=0.5)
+        except (ProcessLookupError, OSError, ValueError):
+            pass
+    
+    # На Windows дополнительно убить все sing-box процессы, если остались зомби
+    if SYSTEM == "Windows":
+        try:
+            subprocess.run(["taskkill", "/F", "/IM", CORE_NAME], 
+                         capture_output=True, check=False)
+        except:
+            pass
 
-def get_flag_emoji(cc):
-    if not cc or len(cc) != 2 or cc == "XX": return "🏳️"
-    try: return chr(ord(cc[0]) + 127397) + chr(ord(cc[1]) + 127397)
-    except: return "🏳️"
+atexit.register(cleanup_processes)
 
-def robust_base64_decode(s):
-    if not s: return ""
-    s = s.strip().replace(" ", "").replace('-', '+').replace('_', '/')
+# ================== УТИЛИТЫ ==================
+
+def get_flag_emoji(cc: str) -> str:
+    if not cc or len(cc) != 2 or cc == "XX":
+        return "🏳️"
+    cc = cc.upper()
+    try:
+        return chr(ord(cc[0]) + 127397) + chr(ord(cc[1]) + 127397)
+    except (ValueError, TypeError):
+        return "🏳️"
+
+def robust_base64_decode(s: str) -> str:
+    if not s: 
+        return ""
+    s = s.strip()
+    s = s.replace('-', '+').replace('_', '/')
     padding = len(s) % 4
-    if padding: s += '=' * (4 - padding)
-    try: return base64.b64decode(s).decode('utf-8', errors='ignore')
-    except: return ""
+    if padding:
+        s += '=' * (4 - padding)
+    try:
+        decoded_bytes = base64.b64decode(s, validate=True)
+        return decoded_bytes.decode('utf-8', errors='ignore')
+    except (binascii.Error, ValueError):
+        return ""
+    except UnicodeDecodeError:
+        return ""
 
-def validate_port(p):
-    try: return 1 <= int(p) <= 65535
-    except: return False
-
-def is_port_free(port):
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        return s.connect_ex(('127.0.0.1', port)) != 0
-
-def find_free_port_block(size):
+def find_free_port_block(size: int) -> int:
     for _ in range(50):
         start = random.randint(20000, 55000)
         if is_port_free(start) and is_port_free(start + size - 1):
             return start
-    raise RuntimeError("Нет свободных портов")
+    raise RuntimeError("Не удалось найти свободный блок портов")
 
-def tcp_precheck_task(host, port):
-    with TCP_SEM:
-        try:
-            with socket.create_connection((host, port), timeout=2.5): return True
-        except: return False
+def is_port_free(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        return s.connect_ex(('127.0.0.1', port)) != 0
 
-def clean_url_logic(link):
+def clean_url(link: str) -> str:
     try:
         link = link.strip()
-        if '#' in link: link = link.split('#')[0]
-        if "://" in link:
-            u = urlparse(link)
-            if u.query:
-                q = parse_qs(u.query, keep_blank_values=True)
-                changed = False
-                for junk in ['name', 'spider', 'remarks', 'plugin', 'udp', 'allowInsecure']:
-                    if junk in q: del q[junk]; changed = True
-                if changed:
-                    new_query = urlencode(q, doseq=True)
-                    link = urlunparse((u.scheme, u.netloc, u.path, u.params, new_query, ''))
+        if '#' in link:
+            link = link.split('#')[0]
         return link
-    except: return link
-
-@contextmanager
-def managed_process(cmd):
-    proc = None
-    try:
-        if SYSTEM == "Windows":
-            si = subprocess.STARTUPINFO()
-            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, startupinfo=si, creationflags=0x08000000)
-        else:
-            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        yield proc
-    finally:
-        if proc:
-            try:
-                if SYSTEM == "Windows": subprocess.call(['taskkill', '/F', '/T', '/PID', str(proc.pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                else: proc.terminate(); proc.wait(timeout=1)
-            except: pass
+    except (AttributeError, TypeError):
+        return link
 
 def ensure_core():
-    if os.path.exists(CORE_EXE): return
-    print(f"[*] Скачивание Sing-box v{SING_VER}...")
+    if os.path.exists(CORE_NAME):
+        return
+
+    url = SING_URLS.get(SYSTEM)
+    if not url:
+        print(f"❌ Ваша ОС ({SYSTEM}) не поддерживается.")
+        sys.exit(1)
+
+    print(f"{Fore.YELLOW}[*] Скачивание Sing-box v{SING_VER}...{Style.RESET_ALL}")
     try:
-        urllib.request.urlretrieve(CORE_URL, "singbox_archive")
-        if CORE_URL.endswith('.zip'):
-            with zipfile.ZipFile("singbox_archive", "r") as z:
+        import zipfile
+        import tarfile
+        
+        local_filename = "singbox_archive"
+        urllib.request.urlretrieve(url, local_filename)
+
+        if url.endswith('.zip'):
+            with zipfile.ZipFile(local_filename, "r") as z:
                 for f in z.namelist():
-                    if f.endswith(CORE_EXE) or f.endswith("sing-box.exe"):
-                        with open(CORE_EXE, "wb") as fo: fo.write(z.read(f)); break
+                    if f.endswith("sing-box.exe") or (not f.endswith(".exe") and f.endswith("sing-box")):
+                        with open(CORE_NAME, "wb") as fo:
+                            fo.write(z.read(f))
+                        break
         else:
-            import tarfile
-            with tarfile.open("singbox_archive", "r:gz") as t:
+            with tarfile.open(local_filename, "r:gz") as t:
                 for m in t.getmembers():
                     if m.name.endswith("sing-box"):
-                        with open(CORE_EXE, "wb") as fo: fo.write(t.extractfile(m).read()); break
+                        f = t.extractfile(m)
+                        if f:
+                            with open(CORE_NAME, "wb") as fo:
+                                fo.write(f.read())
+                        break
         
-        if SYSTEM != "Windows": os.chmod(CORE_EXE, 0o755)
-        os.remove("singbox_archive")
-    except Exception as e:
-        print(f"❌ Ошибка: {e}")
-        exit(1)
+        if SYSTEM != "Windows":
+            os.chmod(CORE_NAME, 0o755)
+        
+        if os.path.exists(local_filename):
+            os.remove(local_filename)
+            
+        print(f"{Fore.GREEN}[✓] Sing-box установлен.{Style.RESET_ALL}")
+
+    except (OSError, IOError, zipfile.BadZipFile, tarfile.TarError) as e:
+        print(f"❌ Ошибка установки ядра: {e}")
+        sys.exit(1)
 
 # ================== ПАРСЕР ==================
 
-def parse_proxy(link, tag):
+def parse_proxy(link: str, tag: str) -> Tuple[Optional[dict], Optional[str], Optional[str], Optional[int]]:
     try:
         link = link.strip()
-        if not link: return None, None, False, None, None
+        if not link: 
+            return None, None, None, None
+        
+        remark = ""
+        if '#' in link:
+            link, remark = link.split('#', 1)
+            remark = unquote(remark)
         
         outbound = {}
         proto = "Unknown"
-        fp = "chrome" 
         r_host, r_port = None, None
 
+        # --- VMESS ---
         if link.startswith("vmess://"):
             proto = "VMess"
-            j = json.loads(robust_base64_decode(link[8:]))
-            r_port = int(j.get("port", 0) or j.get("server_port", 0))
-            if not validate_port(r_port): return None, None, False, None, None
-            
-            r_host = j.get("add") or j.get("host") or j.get("ip")
-            outbound = {"type": "vmess", "tag": tag, "server": r_host, "server_port": r_port, "uuid": j.get("id") or j.get("uuid"), "security": "auto"}
-            
-            net = j.get("net", "tcp")
-            if net in ["ws", "websocket"]:
-                outbound["transport"] = {"type": "ws", "path": j.get("path", "/"), "headers": {"Host": j.get("host", "")}}
-            elif net == "grpc":
-                outbound["transport"] = {"type": "grpc", "service_name": j.get("path", "")}
-            
-            if str(j.get("tls", "")).lower() in ["tls", "1", "true"]:
-                outbound["tls"] = {"enabled": True, "server_name": j.get("sni") or j.get("host") or r_host, "insecure": True, "utls": {"enabled": True, "fingerprint": fp}}
+            try:
+                b64 = link[8:]
+                j = json.loads(robust_base64_decode(b64))
+                
+                r_host = j.get("add") or j.get("host") or j.get("ip")
+                try: 
+                    r_port = int(j.get("port") or j.get("server_port") or 443)
+                except (ValueError, TypeError): 
+                    return None, None, None, None
 
-        elif link.startswith("vless://"):
-            proto = "VLESS"
-            u = urlparse(link); q = parse_qs(u.query)
-            if not validate_port(str(u.port)): return None, None, False, None, None
-            r_host, r_port = u.hostname, u.port
-            outbound = {"type": "vless", "tag": tag, "server": r_host, "server_port": r_port, "uuid": u.username, "flow": q.get("flow", [""])[0]}
-            
-            type_net = q.get("type", ["tcp"])[0]
-            if type_net == "ws": outbound["transport"] = {"type": "ws", "path": q.get("path", ["/"])[0], "headers": {"Host": q.get("host", [""])[0]}}
-            elif type_net == "grpc": outbound["transport"] = {"type": "grpc", "service_name": q.get("serviceName", [""])[0]}
-            
-            sec = q.get("security", ["none"])[0]
-            if sec == "tls":
-                outbound["tls"] = {"enabled": True, "server_name": q.get("sni", [""])[0] or r_host, "insecure": True, "utls": {"enabled": True, "fingerprint": fp}}
-            elif sec == "reality":
-                outbound["tls"] = {"enabled": True, "server_name": q.get("sni", [""])[0] or r_host, "reality": {"enabled": True, "public_key": q.get("pbk", [""])[0], "short_id": q.get("sid", [""])[0]}, "utls": {"enabled": True, "fingerprint": q.get("fp", [fp])[0]}}
+                outbound = {
+                    "type": "vmess",
+                    "tag": tag,
+                    "server": r_host,
+                    "server_port": r_port,
+                    "uuid": j.get("id") or j.get("uuid"),
+                    "security": "auto"
+                }
+                
+                net = j.get("net", "tcp").lower()
+                type_header = j.get("type", "none").lower()
+                host_header = j.get("host", "")
+                path_header = j.get("path", "/")
 
+                if net in ["ws", "websocket"]:
+                    outbound["transport"] = {
+                        "type": "ws",
+                        "path": path_header,
+                        "headers": {"Host": host_header} if host_header else {}
+                    }
+                elif net == "grpc":
+                    outbound["transport"] = {
+                        "type": "grpc",
+                        "service_name": path_header or "grpc"
+                    }
+                elif net in ["h2", "http"]:
+                    outbound["transport"] = {
+                        "type": "http",
+                        "host": [host_header] if host_header else [],
+                        "path": path_header
+                    }
+                
+                tls_val = str(j.get("tls", "")).lower()
+                if tls_val in ["tls", "1", "true"]:
+                    outbound["tls"] = {
+                        "enabled": True,
+                        "server_name": j.get("sni") or host_header or r_host,
+                        "insecure": True
+                    }
+            except (json.JSONDecodeError, KeyError, ValueError, TypeError) as e:
+                logger.debug(f"VMess parse error: {e}")
+                return None, None, None, None
+
+        # --- VLESS / TROJAN ---
+        elif link.startswith(("vless://", "trojan://")):
+            is_trojan = link.startswith("trojan://")
+            proto = "Trojan" if is_trojan else "VLESS"
+            
+            try:
+                u = urlparse(link)
+                q = parse_qs(u.query)
+                r_host, r_port = u.hostname, u.port
+                if not r_host or not r_port: 
+                    return None, None, None, None
+                
+                outbound = {
+                    "type": "trojan" if is_trojan else "vless",
+                    "tag": tag,
+                    "server": r_host,
+                    "server_port": r_port
+                }
+
+                if is_trojan:
+                    outbound["password"] = unquote(u.username or "")
+                else:
+                    outbound["uuid"] = u.username
+                    outbound["flow"] = q.get("flow", [""])[0]
+
+                type_net = q.get("type", ["tcp"])[0]
+                if type_net == "ws":
+                    outbound["transport"] = {
+                        "type": "ws",
+                        "path": q.get("path", ["/"])[0],
+                        "headers": {"Host": q.get("host", [""])[0]}
+                    }
+                elif type_net == "grpc":
+                    outbound["transport"] = {
+                        "type": "grpc",
+                        "service_name": q.get("serviceName", [""])[0]
+                    }
+                elif type_net == "http":
+                    outbound["transport"] = {
+                        "type": "http",
+                        "path": q.get("path", ["/"])[0],
+                        "host": [q.get("host", [""])[0]]
+                    }
+
+                sec = q.get("security", ["tls" if is_trojan else "none"])[0]
+                sni = q.get("sni", [""])[0] or q.get("host", [""])[0] or r_host
+
+                if sec == "tls":
+                    outbound["tls"] = {
+                        "enabled": True,
+                        "server_name": sni,
+                        "insecure": True
+                    }
+                elif sec == "reality":
+                    pbk = q.get("pbk", [""])[0]
+                    sid = q.get("sid", [""])[0]
+                    
+                    if not pbk: 
+                        return None, None, None, None
+                    
+                    outbound["tls"] = {
+                        "enabled": True,
+                        "server_name": sni,
+                        "reality": {
+                            "enabled": True,
+                            "public_key": pbk,
+                            "short_id": sid
+                        },
+                        "utls": {"enabled": True, "fingerprint": q.get("fp", ["chrome"])[0]}
+                    }
+            except (ValueError, AttributeError) as e:
+                logger.debug(f"VLESS/Trojan parse error: {e}")
+                return None, None, None, None
+
+        # --- SHADOWSOCKS ---
         elif link.startswith("ss://"):
             proto = "Shadowsocks"
-            parsed = urlparse(link)
-            if not parsed.netloc:
-                parts = link[5:].split('#', 1)
-                decoded = robust_base64_decode(parts[0])
-                if '@' in decoded: parsed = urlparse(f"ss://{decoded}")
-            
-            if parsed.netloc and '@' in parsed.netloc:
-                userinfo, host_port = parsed.netloc.rsplit('@', 1)
-                r_host, p_str = host_port.rsplit(':', 1)
-                p_str = p_str.split('/')[0].split('?')[0]
-                if validate_port(p_str):
-                    r_port = int(p_str)
-                    if ':' not in userinfo: userinfo = robust_base64_decode(userinfo)
-                    if ':' in userinfo:
-                        method, pwd = userinfo.split(':', 1)
-                        outbound = {"type": "shadowsocks", "tag": tag, "server": r_host, "server_port": r_port, "method": method, "password": unquote(pwd)}
+            try:
+                raw = link[5:]
+                if '@' in raw:
+                    userinfo, hostport = raw.rsplit('@', 1)
+                    r_host, port_str = hostport.split(':')
+                    r_port = int(port_str)
+                    
+                    if ':' not in userinfo:
+                        userinfo = robust_base64_decode(userinfo)
+                    
+                    if ':' not in userinfo: 
+                        return None, None, None, None
+                    method, password = userinfo.split(':', 1)
+                else:
+                    decoded = robust_base64_decode(raw)
+                    if '@' in decoded:
+                        userinfo, hostport = decoded.rsplit('@', 1)
+                        r_host, port_str = hostport.split(':')
+                        r_port = int(port_str)
+                        method, password = userinfo.split(':', 1)
+                    else:
+                        return None, None, None, None
 
-        elif link.startswith("trojan://"):
-            proto = "Trojan"
-            u = urlparse(link); q = parse_qs(u.query)
-            if not u.port or not validate_port(str(u.port)): return None, None, False, None, None
-            r_host, r_port = u.hostname, u.port
-            outbound = {"type": "trojan", "tag": tag, "server": r_host, "server_port": r_port, "password": u.username, "tls": {"enabled": True, "server_name": q.get("sni", [""])[0] or r_host, "insecure": True, "utls": {"enabled": True, "fingerprint": fp}}}
+                outbound = {
+                    "type": "shadowsocks",
+                    "tag": tag,
+                    "server": r_host,
+                    "server_port": r_port,
+                    "method": method,
+                    "password": unquote(password)
+                }
+            except (ValueError, IndexError, UnicodeDecodeError) as e:
+                logger.debug(f"Shadowsocks parse error: {e}")
+                return None, None, None, None
 
+        # --- HYSTERIA 2 ---
         elif link.startswith(("hy2://", "hysteria2://")):
             proto = "Hysteria2"
-            u = urlparse(link); q = parse_qs(u.query)
-            if not u.port or not validate_port(str(u.port)): return None, None, False, None, None
-            pwd = unquote(u.password or u.username or "")
-            r_host, r_port = u.hostname, u.port
-            sni = q.get("sni", [u.hostname])[0]
-            outbound = {"type": "hysteria2", "tag": tag, "server": r_host, "server_port": r_port, "password": pwd,
-                "tls": {"enabled": True, "server_name": sni, "insecure": True, "alpn": ["h3"]}}
-            if q.get("obfs-password"): outbound["obfs"] = {"type": "salamander", "password": q.get("obfs-password")[0]}
-
-        if not outbound: return None, None, False, None, None
+            try:
+                u = urlparse(link)
+                r_host, r_port = u.hostname, u.port
+                outbound = {
+                    "type": "hysteria2",
+                    "tag": tag,
+                    "server": r_host,
+                    "server_port": r_port,
+                    "password": unquote(u.username or ""),
+                    "tls": {
+                        "enabled": True,
+                        "server_name": parse_qs(u.query).get("sni", [r_host])[0],
+                        "insecure": True
+                    }
+                }
+            except (ValueError, AttributeError) as e:
+                logger.debug(f"Hysteria2 parse error: {e}")
+                return None, None, None, None
+            
+        if not outbound or not r_host or not r_port:
+            return None, None, None, None
+            
         return outbound, proto, r_host, r_port
-    except: return None, None, False, None, None
 
-# ================== CHECK CORE ==================
+    except Exception as e:
+        logger.warning(f"Unexpected parse error for link starting with {link[:10]}...: {e}")
+        return None, None, None, None
 
-def wait_for_ports(start_port, count, timeout):
-    deadline = time.time() + timeout
-    ports_to_check = [start_port + i for i in range(min(count, 3))]
-    while time.time() < deadline:
-        ready = 0
-        for p in ports_to_check:
-            try:
-                with socket.create_connection(("127.0.0.1", p), timeout=0.1): ready += 1
-            except: pass
-        if ready == len(ports_to_check): return True
-        time.sleep(0.1)
-    return False
+# ================== ASYNC CHECKER ==================
 
-def check_one_http(args):
-    idx, item, sp, local_ip = args
-    port = sp + idx
-    proxies = {'http': f'http://127.0.0.1:{port}', 'https': f'http://127.0.0.1:{port}'}
+async def check_proxy_http(session: aiohttp.ClientSession, port: int, item: dict, my_ip: str) -> dict:
+    proxy_url = f"http://127.0.0.1:{port}"
+    result = {"ok": False, "msg": "", "cc": "XX", "ping": 0, "item": item}
+    
     try:
-        t_start = time.time()
-        resp = requests.get(PING_URL, proxies=proxies, timeout=TIMEOUT_SEC, verify=False, allow_redirects=False)
-        lat = int((time.time() - t_start) * 1000)
+        t0 = time.time()
+        async with session.get(PING_URL, proxy=proxy_url, timeout=TIMEOUT_SEC, allow_redirects=False, ssl=False) as resp:
+            ping = int((time.time() - t0) * 1000)
+            
+            if resp.status not in [200, 204]:
+                result["msg"] = f"HTTP {resp.status}"
+                return result
+            
+            result["ping"] = ping
+            
+            try:
+                async with session.get(GEO_URL, proxy=proxy_url, timeout=5, ssl=False) as geo_resp:
+                    data = await geo_resp.json()
+                    remote_ip = data.get("query", "")
+                    cc = data.get("countryCode", "XX")
+                    
+                    if my_ip and remote_ip == my_ip:
+                        result["msg"] = "IP Leak"
+                        return result
+                    
+                    result["ok"] = True
+                    result["cc"] = cc
+                    result["msg"] = "OK"
+            except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError, KeyError):
+                result["ok"] = True
+                result["msg"] = "No Geo"
+                
+    except asyncio.TimeoutError:
+        result["msg"] = "Timeout"
+    except aiohttp.ClientConnectionError:
+        result["msg"] = "Conn Error"
+    except aiohttp.ClientResponseError as e:
+        result["msg"] = f"HTTP {e.status}"
+    except aiohttp.ClientError as e:
+        result["msg"] = f"Network Error"
+    except Exception as e:
+        logger.error(f"Unexpected check error for port {port}: {e}")
+        result["msg"] = "Error"
         
-        if resp.status_code == 204 or (resp.status_code == 200 and len(resp.content) < 1000):
-            try:
-                geo_resp = requests.get(GEO_URL, proxies=proxies, timeout=3, verify=False).json()
-                remote_ip = geo_resp.get("ip")
-                country = geo_resp.get("cc", "XX")
-                if CHECK_IP_LEAK and local_ip and remote_ip == local_ip: return (False, "IP Leak", None, item)
-                return (True, f"{lat}ms", country, item)
-            except: return (True, f"{lat}ms", "XX", item)
-        else: return (False, "Bad Status", None, item)
-    except requests.exceptions.Timeout: return (False, "Timeout", None, item)
-    except requests.exceptions.SSLError: return (False, "SSL Error", None, item)
-    except: return (False, "Conn Error", None, item)
+    return result
 
-def process_batch(chunk, pbar, local_ip):
+async def run_singbox_batch(chunk: List[dict], my_ip: str, pbar: tqdm):
     try:
-        sp = find_free_port_block(len(chunk))
-    except:
-        for item in chunk: item['result'] = (False, "No Ports")
+        start_port = find_free_port_block(len(chunk))
+    except RuntimeError:
+        for item in chunk: 
+            item['result'] = (False, "No Ports", "XX")
         pbar.update(len(chunk))
         return
+
+    inbounds = []
+    outbounds = []
+    rules = []
     
-    inbounds = [{"type": "mixed", "tag": f"in_{sp+i}", "listen": "127.0.0.1", "listen_port": sp+i, "sniff": False} for i in range(len(chunk))]
-    outbounds = [i['config'] for i in chunk] + [{"type": "direct", "tag": "direct"}, {"type": "dns", "tag": "dns-out"}]
-    rules = [{"inbound": f"in_{sp+i}", "outbound": chunk[i]['tag']} for i in range(len(chunk))]
-    config = {"log": {"level": "fatal"}, "inbounds": inbounds, "outbounds": outbounds, "route": {"rules": rules}}
+    for i, item in enumerate(chunk):
+        port = start_port + i
+        in_tag = f"in_{port}"
+        out_tag = item['tag']
+        
+        inbounds.append({
+            "type": "mixed",
+            "tag": in_tag,
+            "listen": "127.0.0.1",
+            "listen_port": port,
+            "sniff": False
+        })
+        outbounds.append(item['config'])
+        rules.append({"inbound": in_tag, "outbound": out_tag})
+
+    outbounds.append({"type": "direct", "tag": "direct"})
+    outbounds.append({"type": "dns", "tag": "dns-out"})
     
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tmp:
-        json.dump(config, tmp); cfg_file = tmp.name
+# Найдите эту строку в run_singbox_batch():
+    config = {
+        "log": {"level": "fatal", "output": "box.log"},
+        "dns": {
+            "servers": [
+                {
+                    "tag": "google",
+                    "address": "tls://8.8.8.8",  # Через TLS, не системный
+                    "strategy": "ipv4_only",
+                    "detour": "direct"
+                }
+            ],
+            "final": "google",
+            "independent_cache": True,
+            "disable_cache": False
+        },
+        "inbounds": inbounds,
+        "outbounds": outbounds,
+        "route": {
+            "rules": rules,
+            "auto_detect_interface": True,  # <-- ОБЯЗАТЕЛЬНО True!
+            "final": "direct",
+            "default_interface": ""  # Пусто = автоопределение
+        }
+    }
+    
+    cfg_file = f"temp_cfg_{start_port}.json"
     
     try:
-        with managed_process([CORE_EXE, "run", "-c", cfg_file]) as proc:
-            if not wait_for_ports(sp, len(chunk), STARTUP_TIMEOUT):
-                for item in chunk: item['result'] = (False, "Bind Fail")
-                pbar.update(len(chunk))
-                return
+        with open(cfg_file, 'w') as f:
+            json.dump(config, f)
+    except (OSError, IOError) as e:
+        logger.error(f"Failed to write config file {cfg_file}: {e}")
+        for item in chunk: 
+            item['result'] = (False, f"IO Error", "XX")
+        pbar.update(len(chunk))
+        return
+
+    proc = None
+    try:
+        cmd = [f"./{CORE_NAME}"] if SYSTEM != "Windows" else [CORE_NAME]
+        cmd.extend(["run", "-c", cfg_file])
+        
+        if SYSTEM == "Windows":
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            proc = subprocess.Popen(cmd, startupinfo=si, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             
-            time.sleep(0.5)
+        ACTIVE_PROCESSES.append(proc)
+        
+        await asyncio.sleep(2)
+        
+        if proc.poll() is not None:
+            for item in chunk: 
+                item['result'] = (False, "Core Died", "XX")
+            pbar.update(len(chunk))
+            return
+
+        async with aiohttp.ClientSession() as session:
+            tasks = []
+            for i, item in enumerate(chunk):
+                tasks.append(check_proxy_http(session, start_port + i, item, my_ip))
             
-            args = [(i, item, sp, local_ip) for i, item in enumerate(chunk)]
-            futures = {GLOBAL_POOL.submit(check_one_http, a): a[1] for a in args}
+            results = await asyncio.gather(*tasks)
             
-            for future in as_completed(futures):
-                item = futures[future]
-                try:
-                    ok, msg, cc, _ = future.result()
-                    item['result'] = (ok, msg, cc) if ok else (False, msg)
-                except: item['result'] = (False, "Err")
+            for res in results:
+                item = res["item"]
+                if res["ok"]:
+                    item["result"] = (True, f"{res['ping']}ms", res["cc"])
+                else:
+                    item["result"] = (False, res["msg"], "XX")
                 pbar.update(1)
+
+    except (OSError, PermissionError, FileNotFoundError) as e:
+        logger.error(f"Subprocess error: {e}")
+        for item in chunk: 
+            item['result'] = (False, f"Process Error", "XX")
+        pbar.update(len(chunk))
+    except Exception as e:
+        logger.error(f"Batch error: {e}")
     finally:
-        try: os.remove(cfg_file)
-        except: pass
-        if PAUSE_BETWEEN_BATCHES > 0: time.sleep(PAUSE_BETWEEN_BATCHES)
+        if proc:
+            try: 
+                proc.terminate()
+            except (ProcessLookupError, OSError):
+                pass
+            if proc in ACTIVE_PROCESSES: 
+                ACTIVE_PROCESSES.remove(proc)
+        
+        if os.path.exists(cfg_file):
+            try: 
+                os.remove(cfg_file)
+            except (OSError, FileNotFoundError):
+                pass
 
-def print_final_stats(total_processed, live_results, error_counts, start_time):
-    duration = time.time() - start_time
-    speed = total_processed / duration if duration > 0 else 0
-    success_rate = (len(live_results) / total_processed * 100) if total_processed > 0 else 0
+def print_statistics(parsed_proxies: List[dict], duplicates_count: int):
+    """Вывод красивой статистики"""
+    if not parsed_proxies: 
+        return
+
+    live_counts = Counter()
+    total_counts = Counter()
+    error_counts = Counter()
     
-    # Ping Stats
-    all_pings = [x[0] for x in live_results]
-    if all_pings:
-        avg_ping = int(statistics.mean(all_pings))
-        median_ping = int(statistics.median(all_pings))
-        min_ping = min(all_pings)
-        max_ping = max(all_pings)
-        fast_proxies = len([p for p in all_pings if p < 500])
-    else:
-        avg_ping = median_ping = min_ping = max_ping = fast_proxies = 0
-
-    # Country Stats
-    countries = Counter([x[3] for x in live_results])
+    total_live = 0
     
-    # Protocol Stats
-    protocols = Counter([x[2] for x in live_results])
+    for p in parsed_proxies:
+        proto = p['proto']
+        total_counts[proto] += 1
+        
+        res = p['result']
+        if res and res[0]: 
+            live_counts[proto] += 1
+            total_live += 1
+        else:
+            msg = res[1] if res else "Unknown"
+            error_counts[msg] += 1
 
-    print(f"\n{Fore.CYAN}{'='*60}")
-    print(f"{Fore.WHITE}{Style.BRIGHT}   📊 РАСШИРЕННАЯ СТАТИСТИКА")
+    print(f"\n{Fore.WHITE}{Style.BRIGHT}{'='*22} СТАТИСТИКА {'='*22}{Style.RESET_ALL}")
+    print(f"{Fore.YELLOW}Всего загружено: {Fore.WHITE}{len(parsed_proxies) + duplicates_count}")
+    print(f"{Fore.RED}Удалено дублей:  {Fore.WHITE}{duplicates_count}")
+    print(f"{Fore.CYAN}Проверено (уник): {Fore.WHITE}{len(parsed_proxies)}")
+    print(f"{Fore.GREEN}Всего живых:     {Fore.WHITE}{total_live} ({total_live / len(parsed_proxies) * 100:.1f}%)")
+    
+    print(f"\n{Fore.BLUE}{Style.BRIGHT}{'ПРОТОКОЛ':<15} | {'ЖИВЫЕ':<8} | {'ВСЕГО':<8} | {'УСПЕХ %':<8}{Style.RESET_ALL}")
+    print("-" * 50)
+    
+    for proto in sorted(total_counts.keys()):
+        live = live_counts[proto]
+        total = total_counts[proto]
+        rate = (live / total * 100) if total > 0 else 0
+        
+        color = Fore.GREEN if rate > 50 else (Fore.YELLOW if rate > 10 else Fore.RED)
+        print(f"{proto:<15} | {Fore.GREEN}{live:<8}{Style.RESET_ALL} | {total:<8} | {color}{rate:.1f}%{Style.RESET_ALL}")
+
+    print(f"\n{Fore.RED}{Style.BRIGHT}ТОП ОШИБОК:{Style.RESET_ALL}")
+    for err, count in error_counts.most_common(5):
+        print(f" - {err:<15}: {count}")
+    print("=" * 56)
+
+async def main_async():
     print(f"{Fore.CYAN}{'='*60}{Style.RESET_ALL}")
-    
-    print(f"⏱  Время: {Fore.YELLOW}{duration:.1f}s{Style.RESET_ALL} | Скорость: {Fore.YELLOW}{speed:.1f} prx/s{Style.RESET_ALL}")
-    print(f"✅ Результат: {Fore.GREEN}{len(live_results)}{Style.RESET_ALL}/{total_processed} ({Fore.MAGENTA}{success_rate:.1f}%{Style.RESET_ALL})")
-    
-    if all_pings:
-        print(f"\n🚀 {Style.BRIGHT}ПИНГ И СКОРОСТЬ:{Style.RESET_ALL}")
-        print(f"   • Мин: {Fore.GREEN}{min_ping}ms{Style.RESET_ALL} | Макс: {Fore.RED}{max_ping}ms{Style.RESET_ALL}")
-        print(f"   • Средний: {Fore.YELLOW}{avg_ping}ms{Style.RESET_ALL} | Медиана: {Fore.CYAN}{median_ping}ms{Style.RESET_ALL}")
-        print(f"   • Быстрых (<500ms): {Fore.GREEN}{fast_proxies}{Style.RESET_ALL} ({int(fast_proxies/len(live_results)*100)}%)")
-
-    if countries:
-        print(f"\n🌍 {Style.BRIGHT}ТОП-10 СТРАН:{Style.RESET_ALL}")
-        for cc, count in countries.most_common(10):
-            print(f"   {get_flag_emoji(cc)} {cc:<4}: {count}")
-
-    if protocols:
-        print(f"\n📂 {Style.BRIGHT}ПРОТОКОЛЫ:{Style.RESET_ALL}")
-        for proto, count in protocols.most_common():
-            print(f"   • {proto:<15}: {count}")
-
-    if error_counts:
-        print(f"\n❌ {Style.BRIGHT}АНАЛИЗ ОШИБОК (ТОП):{Style.RESET_ALL}")
-        for err, count in error_counts.most_common(5):
-             print(f"   • {err:<15}: {Fore.RED}{count}{Style.RESET_ALL}")
-    
-    print(f"{Fore.CYAN}{'='*60}{Style.RESET_ALL}")
-
-# ================== MAIN ==================
-
-def main():
-    start_time_all = time.time()
-    print(f"{Fore.CYAN}{'='*60}{Style.RESET_ALL}")
-    print(f"{Fore.WHITE}{Style.BRIGHT}   🚀 PROXY CHECKER v5.7 (STATS+) | {SYSTEM}{Style.RESET_ALL}")
+    print(f"{Fore.WHITE}{Style.BRIGHT}   🚀 PROXY CHECKER v6.5 (Smart Deduplication) | {SYSTEM}{Style.RESET_ALL}")
     print(f"{Fore.CYAN}{'='*60}{Style.RESET_ALL}\n")
-    
+
     ensure_core()
     
+    my_ip = None
     try:
-        my_ip = requests.get(GEO_URL, timeout=8).json().get("ip")
+        print("[*] Определение IP...")
+        async with aiohttp.ClientSession() as s:
+            async with s.get("http://api.ipify.org?format=json", timeout=5) as r:
+                data = await r.json()
+                my_ip = data.get("ip")
         print(f"[*] Ваш IP: {Fore.GREEN}{my_ip}{Style.RESET_ALL}")
-    except: my_ip = None
+    except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError, KeyError):
+        print(f"[*] Ваш IP: {Fore.RED}Не определен{Style.RESET_ALL}")
+
+    os.makedirs(KEYS_DIR, exist_ok=True)
+    os.makedirs(OUT_DIR, exist_ok=True)
     
     raw_keys = []
     if os.path.exists(KEYS_DIR):
@@ -405,77 +650,110 @@ def main():
             if fn.endswith(".txt"):
                 try:
                     with open(os.path.join(KEYS_DIR, fn), "r", encoding="utf-8", errors="ignore") as f:
-                        raw_keys.extend([l.strip() for l in f if len(l.strip()) >= 15])
-                except: pass
-    
+                        raw_keys.extend([l.strip() for l in f if len(l.strip()) > 10])
+                except (IOError, OSError) as e:
+                    print(f"Ошибка чтения {fn}: {e}")
+
     raw_keys = list(set(raw_keys))
     print(f"\n{Fore.BLUE}[*] Загружено строк: {len(raw_keys)}{Style.RESET_ALL}")
-    
+
     parsed_proxies = []
     unique_fp = set()
+    duplicates_count = 0
     
-    print(f"[*] Парсинг и дедупликация (Smart Mode)...")
-    for link in tqdm(raw_keys, desc="Parsing", ncols=80):
-        try:
-            cl = clean_url_logic(link)
-            tag = f"p_{uuid.uuid4().hex[:8]}"
-            out, proto, h, p = parse_proxy(cl, tag)
+    print("[*] Парсинг конфигов...")
+    for link in tqdm(raw_keys, desc="Parsing", ncols=70):
+        tag = f"p_{uuid.uuid4().hex[:6]}"
+        out, proto, h, p = parse_proxy(link, tag)
+        if out:
+            # УЛУЧШЕННАЯ ДЕДУПЛИКАЦИЯ: хеш конфигурации без runtime tag
+            config_clean = {k: v for k, v in out.items() if k != 'tag'}
+            fp = hashlib.md5(json.dumps(config_clean, sort_keys=True).encode()).hexdigest()
             
-            if out and h and p:
-                auth = str(out.get("uuid", out.get("password", "")))
-                key = f"{h}:{p}:{proto}:{auth}"
-                
-                if key not in unique_fp:
-                    unique_fp.add(key)
-                    parsed_proxies.append({'link': cl, 'tag': tag, 'config': out, 'proto': proto, 'host': h, 'port': p, 'result': None})
-        except: continue
-    
-    print(f"{Fore.CYAN}[✓] Уникальных конфигов: {len(parsed_proxies)} (из {len(raw_keys)}){Style.RESET_ALL}")
-    if not parsed_proxies: return
+            if fp not in unique_fp:
+                unique_fp.add(fp)
+                parsed_proxies.append({
+                    'link': link,
+                    'tag': tag,
+                    'config': out,
+                    'proto': proto,
+                    'result': None
+                })
+            else:
+                duplicates_count += 1
 
-    print(f"\n{Fore.YELLOW}[*] TCP Check (отсев мертвых портов)...{Style.RESET_ALL}")
-    alive = []
-    futures = {GLOBAL_POOL.submit(tcp_precheck_task, i['host'], i['port']): i for i in parsed_proxies}
-    
-    for f in tqdm(as_completed(futures), total=len(parsed_proxies), desc="TCP Check", ncols=80, colour='yellow'):
-        if f.result(): alive.append(futures[f])
-    
-    tcp_closed_count = len(parsed_proxies) - len(alive)
-    print(f"{Fore.GREEN}[✓] Живых TCP: {len(alive)}{Style.RESET_ALL}")
-    if not alive: return
+    print(f"{Fore.CYAN}[✓] Уникальных валидных: {len(parsed_proxies)} (Удалено дублей по конфигурации: {duplicates_count}){Style.RESET_ALL}")
+    if not parsed_proxies: 
+        return
 
-    print(f"\n{Fore.CYAN}[*] Full Check ({len(alive)})...{Style.RESET_ALL}")
-    chunks = [alive[i:i + BATCH_SIZE] for i in range(0, len(alive), BATCH_SIZE)]
+    chunks = [parsed_proxies[i:i + BATCH_SIZE] for i in range(0, len(parsed_proxies), BATCH_SIZE)]
     
+    print(f"\n{Fore.YELLOW}[*] Запуск проверки...{Style.RESET_ALL}")
+    
+    pbar = tqdm(total=len(parsed_proxies), desc="Checking", ncols=75, colour='green')
+    sem = asyncio.Semaphore(2) 
+    
+    async def limited_batch(c):
+        async with sem:
+            await run_singbox_batch(c, my_ip, pbar)
+
+    tasks = [limited_batch(chunk) for chunk in chunks]
+    await asyncio.gather(*tasks)
+    pbar.close()
+    
+    print_statistics(parsed_proxies, duplicates_count)
+
     live_res = []
-    stats_errors = Counter()
-    
-    # Добавляем ошибки TCP Check в общую статистику
-    if tcp_closed_count > 0:
-        stats_errors['TCP Closed'] += tcp_closed_count
-    
-    with tqdm(total=len(alive), desc="Checking", ncols=80, colour='green') as pbar:
-        for chunk in chunks:
-            process_batch(chunk, pbar, my_ip)
-            for item in chunk:
-                res = item['result']
-                if res and res[0]:
-                    ping = int(res[1].replace("ms", ""))
-                    live_res.append((ping, item['link'], item['proto'], res[2]))
-                else:
-                    msg = res[1] if res else "Unknown"
-                    stats_errors[msg] += 1
-    
-    live_res.sort(key=lambda x: x[0])
-    
-    with open(LIVE_FILE, "w", encoding="utf-8") as f:
-        for ping, link, proto, cc in live_res:
-            name = f"{get_flag_emoji(cc)} {cc} | 🚀 {ping}ms | {proto}"
-            f.write(f"{link}#{name}\n")
-    
-    # ВЫЗОВ НОВОЙ ФУНКЦИИ СТАТИСТИКИ
-    print_final_stats(len(parsed_proxies), live_res, stats_errors, start_time_all)
-    input("Нажмите Enter для выхода...")
+    for p in parsed_proxies:
+        if p['result'] and p['result'][0]:
+            live_res.append(p)
 
+    if not live_res:
+        print(f"\n{Fore.RED}[!] Живых прокси не найдено.{Style.RESET_ALL}")
+        return
+
+    live_res.sort(key=lambda x: int(x['result'][1].replace('ms','')))
+
+    out_file = os.path.join(OUT_DIR, "live.txt")
+    
+    with open(out_file, "w", encoding="utf-8") as f:
+        for p in live_res:
+            ping = p['result'][1]
+            cc = p['result'][2]
+            flag = get_flag_emoji(cc)
+            raw_name = f"{flag} {cc} | ⚡ {ping} | {p['proto']}"
+            
+            if p['link'].startswith("vmess://"):
+                try:
+                    b64_str = p['link'][8:]
+                    j = json.loads(robust_base64_decode(b64_str))
+                    j['ps'] = raw_name
+                    new_json = json.dumps(j, separators=(',', ':'), ensure_ascii=False).encode('utf-8')
+                    final_link = f"vmess://{base64.b64encode(new_json).decode('utf-8')}"
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    final_link = f"{clean_url(p['link'])}#{quote(raw_name)}"
+            else:
+                base_link = clean_url(p['link'])
+                final_link = f"{base_link}#{quote(raw_name)}"
+
+            f.write(f"{final_link}\n")
+
+    print(f"\n{Fore.GREEN}{'='*60}")
+    print(f"📁 Файл сохранен: {out_file}")
+    print(f"{'='*60}{Style.RESET_ALL}")
+    
 if __name__ == "__main__":
-    main()
+    if SYSTEM == "Windows":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    try:
+        asyncio.run(main_async())
+    except KeyboardInterrupt:
+        print("\n[!] Остановлено пользователем")
+        cleanup_processes()
+    except SystemExit:
+        cleanup_processes()
+        raise
+    except Exception as e:
+        print(f"\n{Fore.RED}[!] Критическая ошибка: {e}{Style.RESET_ALL}")
+        cleanup_processes()
+        raise
